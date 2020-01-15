@@ -27,6 +27,9 @@ end
 if ~isfield(options,'useASD')
     options.useASD = 1;
 end
+if ~isfield(options,'filterOffset')
+    options.filterOffset = 1;
+end
 if ~isfield(options,'L2smooth')
     options.L2smooth = 0;
 end
@@ -74,6 +77,9 @@ end
 if ~isfield(options,'GLMtransitions')
     options.GLMtransitions = true;
 end
+if ~isfield(options,'fitEmissions')
+    options.fitEmissions = true;
+end
 if ~isfield(options,'GLMemissions')
     options.GLMemissions = true;
 end
@@ -85,6 +91,60 @@ if ~isfield(options,'numsteps')
 end
 if ~isfield(options,'numsamples')
     options.numsamples = 1;
+end
+if ~isfield(options,'trainBins')
+    options.trainBins = [];
+end
+if ~isfield(options,'CVregularize')
+    options.CVregularize = 0;
+    options.regularSchedule = 1;
+    options.regularScheduleInd = 1;
+
+    options.trainData = 1:length(stim);
+    options.testData = [];
+else
+    if options.CVregularize
+        if ~isfield(options,'regularSchedule')
+            options.regularSchedule = logspace(-4,1,10);
+            options.regularScheduleInd = 8;
+        end
+
+        rdata = randperm(length(stim));
+        options.testData = rdata(1:ceil(.25*length(rdata)));
+        options.trainData = rdata((ceil(.25*length(rdata))+1):end);
+    else
+        options.CVregularize = 0;
+        options.regularSchedule = 1;
+        options.regularScheduleInd = 1;
+        
+        options.trainData = 1:length(stim);
+        options.testData = [];
+    end
+end
+if ~isfield(options,'crossvalidate')
+    options.crossvalidate = 0;
+    if ~options.CVregularize
+        options.trainData = 1:length(stim);
+        options.testData = [];
+    end
+else
+    if options.crossvalidate
+        rdata = randperm(length(stim));
+        options.testData = rdata(1:ceil(.25*length(rdata)));
+        options.trainData = rdata((ceil(.25*length(rdata))+1):end);    
+    else
+        options.crossvalidate = 0;
+        options.trainData = 1:length(stim);
+        options.testData = [];
+    end
+end
+
+if ~isfield(options,'addFilters')
+    options.addFilters = 0;
+else
+    options.initial_emit_w = emit_w;
+    options.initial_trans_w = trans_w;
+    options.initial_analog_emit_w = analog_emit_w;
 end
 
 if isempty(symb)
@@ -153,9 +213,9 @@ loglik = zeros(maxiter+1,1);
 loglik(1) = -10000000;
 thresh = 1e-4;
 
-numstates = max(size(emit_w,1),size(analog_emit_w,1));
+numstates = max(max(size(emit_w,1),size(analog_emit_w,1)),size(trans_w,1));
 numemissions = size(emit_w,2);
-numtotalbins = max(size(emit_w,3),size(trans_w,3));
+numtotalbins = max(max(size(emit_w,3),size(trans_w,3)),size(analog_emit_w,3));
 
 if options.analog_flag
     numAnalogParams = size(analog_symb{1},1);
@@ -221,72 +281,171 @@ for ind = 1:maxiter
 
 %% gradient descent for the emission filter
 
-if options.symbExists
+if options.symbExists && options.fitEmissions
     display('fitting categorical emission filters')
 
-    clear newstim;
-    for trial=1:length(stim)
-        if options.GLMemissions
-            newstim{trial}.data = stim{trial};
-            newstim{trial}.numtotalbins = numtotalbins;
+    clear newstim
+    if options.crossvalidate || options.CVregularize
+        if options.CVregularize
+            CVschedule = options.regularSchedule(max(options.regularScheduleInd-1,1):min(options.regularScheduleInd+1,length(options.regularSchedule)));
         else
-            newstim{trial}.data = stim{trial}(end,:);
-            newstim{trial}.numtotalbins = 1;
+            CVschedule = [options.smoothLambda];
         end
-        newstim{trial}.xi = xi{trial};
-        newstim{trial}.gamma = gamma{trial};
-        newstim{trial}.emit = symb{trial};
+        CVind = 0;
 
-        newstim{trial}.numstates = numemissions;
-    end
-
-    tmp_pgd = zeros(numstates,1);
-    tmp_pgd2 = zeros(numstates,1);
-    tmp_pgd3 = zeros(numstates,numemissions+1,numemissions+1);
-    tmp_pgd4 = zeros(numstates,numemissions+1,numemissions+1);
-    tmp_pgd_lik = zeros(numstates,1);
-    if options.evaluate == 1
-        for i=1:numstates
-            [tmp_pgd_lik(i),tmp_pgd(i),tmp_pgd2(i), tmp_pgd3_2, tmp_pgd4_2] = emitLikelihood(reshape(squeeze(emit_w(i,:,:))',size(emit_w,2)*size(emit_w,3),1), newstim, i);
-            tmp_pgd3(i,:,:) = tmp_pgd3_2;
-            tmp_pgd4(i,:,:) = tmp_pgd4_2;
-        end
-        pgd_lik = sum(tmp_pgd_lik);
-        pgd_prob = sum(tmp_pgd);
-        pgd_prob2 = sum(tmp_pgd2);
-        pgd_prob3 = squeeze(sum(tmp_pgd3,1));
-        pgd_prob4 = squeeze(sum(tmp_pgd4,1));
-
-        if options.generate
-            if options.analog_flag
-                for trial=1:length(stim)
-                    newstim{trial}.analog_symb = analog_symb{trial};
-                    newstim{trial}.analog_emit_w = analog_emit_w;
-                end
+        for thislambda = CVschedule
+            CVind = CVind + 1;
+            % check if we are doing smoothing regularization or Tikhonov
+            % segment data into random subsets for cross validation
+            if options.smoothLambda == -1
+                options.transLambda = thislambda;
+                options.emitLambda = thislambda;
             else
-                for trial=1:length(stim)
-                    newstim{trial}.analog_symb = NaN;
-                    newstim{trial}.analog_emit_w = 0;
-                end
+                options.smoothLambda = thislambda;
             end
-            [output,output_anal] = emitGenerate(reshape(squeeze(emit_w(i,:,:))',size(emit_w,2)*size(emit_w,3),1), newstim, i, options);
+
+            if options.symbExists
+                % fitEmissionFilters should take into account the testData
+                % field...
+                [newEmit_w{CVind}, pgd_lik, pgd_prob, pgd_prob2, pgd_prob3, pgd_prob4] = fitEmissionFilters(stim,symb,gamma,xi,emit_w,options);
+            else
+                pgd_lik = 0;
+            end
+
+            [newTrans_w{CVind}, tgd_lik] = fitTransitionFilters(stim,symb,gamma,xi,trans_w,options);
+
+            if options.analog_flag
+                [newAnalog_emit_w{CVind}, newAnalog_emit_std{CVind},arcorr,arcorr2] = fitAnalogFilters(stim, analog_symb, analog_emit_w, options);
+            end
+            
+            if options.analog_flag
+                for i=1:length(options.testData)
+                    testsymb{i} = symb{options.testData(i)};
+                    testanalogsymb{i} = symb{options.testData(i)};
+                    teststim{i} = stim{options.testData(i)};
+                end
+                [testEmitLik{CVind},testTransLik{CVind},testAnalogLik{CVind},testGamma{CVind},testXi{CVind}] = HMMGLMLikelihoods(outparams.emit, newEmit_w{CVind}, newTrans_w{CVind}, outparams.stim, newAnalog_emit_w{CVind}, outparams.analog_symb, model_options);
+            else
+                for i=1:length(options.testData)
+                    testsymb{i} = symb{options.testData(i)};
+                    teststim{i} = stim{options.testData(i)};
+                end
+                [testEmitLik{CVind},testTransLik{CVind},testAnalogLik{CVind},testGamma{CVind},testXi{CVind}] = HMMGLMLikelihoods(testsymb, newEmit_w{CVind}, newTrans_w{CVind}, teststim, [], [], options);
+            end
+    
+            testFullAnalogEmitLik = 0;
+            testFullEmitLik  = 0;
+            testFullTransLik  = 0;
+            testFullBasicLik = zeros(length(options.testData),1);
+            for i=1:length(options.testData)
+                gamma{i}(gamma{i}(:,1) == 0,1) = eps(0);
+
+                if options.symbExists
+                    testFullEmitLik = testFullEmitLik + -mean(sum(testGamma{CVind}{i} .* log(testEmitLik{CVind}{i})));
+                    testFullTransLik = testFullTransLik + -mean(sum(sum(testXi{CVind}{i} .* log(testTransLik{CVind}{i}(:,:,2:end)))));
+                end
+
+                if options.analog_flag
+                    analogprod = prod(testAnalogLik{CVind}{i},1);
+                    analogprod(analogprod == 0) = eps(0);
+                    if numstates == 1
+                        testFullAnalogEmitLik = testFullAnalogEmitLik + -mean(sum(testGamma{CVind}{i} .* log(squeeze(analogprod)')));
+                    else
+                        testFullAnalogEmitLik = testFullAnalogEmitLik + -mean(sum(testGamma{CVind}{i} .* log(squeeze(analogprod))));
+                    end
+                end
+
+                testFullBasicLik(i) = -sum(testGamma{CVind}{i}(:,1).*log(testGamma{CVind}{i}(:,1)));
+            end
+            testLogLik(CVind) = sum(testFullBasicLik) + testFullEmitLik + testFullTransLik + testFullAnalogEmitLik;
         end
+
+        if options.CVregularize
+            CVinds = max(options.regularScheduleInd-1,1):min(options.regularScheduleInd+1,length(options.regularSchedule));
+            goodInd = find(testLogLik == min(testLogLik));
+
+            if options.symbExists
+                emit_w = newEmit_w{goodInd};
+                trans_w = newTrans_w{goodInd};
+            end
+            if options.analog_flag
+                analog_emit_w = newAnalog_emit_w{goodInd};
+                analog_emit_std = newAnalog_emit_std{goodInd};
+            end
+
+            thislambda = options.regularSchedule(CVinds(goodInd));
+            options.regularScheduleInd = CVinds(goodInd);
+            if options.smoothLambda == -1
+                options.transLambda = thislambda;
+                options.emitLambda = thislambda;
+            else
+                options.smoothLambda = thislambda;
+            end
+        else
+            goodInd = 1;
+        end
+
+        if options.crossvalidate
+            outvars(ind).lambda = thislambda;
+            outvars(ind).loglik_CV = testLogLik(goodInd);
+            outvars(ind).loglik_CVlambda = CVschedule;
+            outvars(ind).loglik_CVall = testLogLik;
+        end
+        
     else
+        for trial=1:length(stim)
+            if options.GLMemissions
+                %             if isempty(options.trainBins)
+                newstim{trial}.data = stim{trial};
+                newstim{trial}.numtotalbins = numtotalbins;
+                %             else
+                %                 newstim{trial}.data = stim{trial}(options.trainBins,:);
+                %                 newstim{trial}.numtotalbins = length(options.trainBins);
+                %             end
+                
+            else
+                newstim{trial}.data = stim{trial}(end,:);
+                newstim{trial}.numtotalbins = 1;
+            end
+            newstim{trial}.xi = xi{trial};
+            newstim{trial}.gamma = gamma{trial};
+            newstim{trial}.emit = symb{trial};
+            
+            newstim{trial}.numstates = numemissions;
+        end
+        
+        tmp_pgd = zeros(numstates,1);
+        tmp_pgd2 = zeros(numstates,1);
+        tmp_pgd3 = zeros(numstates,numemissions+1,numemissions+1);
+        tmp_pgd4 = zeros(numstates,numemissions+1,numemissions+1);
+        tmp_pgd_lik = zeros(numstates,1);
         hessdiag_emit = zeros(numstates,numemissions,numtotalbins);
         for i=1:numstates
             if options.numsteps == 1
+                %                 if isempty(options.trainBins)
                 outweights = minFunc(@(x) emitLearningFun(x, newstim, i, options), reshape(squeeze(emit_w(i,:,:))',size(emit_w,2)*size(emit_w,3),1));
+                emit_w(i,:,:) = reshape(outweights,size(emit_w,3),size(emit_w,2))';
+                %                 else
+                %                     outweights = minFunc(@(x) emitLearningFun(x, newstim, i, options), reshape(squeeze(emit_w(i,:,options.trainBins))',size(emit_w,2)*length(options.trainBins),1));
+                %                     emit_w(i,:,options.trainBins) = reshape(outweights,length(options.trainBins),size(emit_w,2))';
+                %                 end
             else
                 outweights = minFunc(@(x) emitMultistepLearningFun(x, newstim, i, options), reshape(squeeze(emit_w(i,:,:))',size(emit_w,2)*size(emit_w,3),1));
+                emit_w(i,:,:) = reshape(outweights,size(emit_w,3),size(emit_w,2))';
             end
-            emit_w(i,:,:) = reshape(outweights,size(emit_w,3),size(emit_w,2))';
-
-            [tmp_pgd(i),hessd] = emitLearningStats(reshape(squeeze(emit_w(i,:,:))',size(emit_w,2)*size(emit_w,3),1), newstim, i, options);
-            hessdiag_emit(i,:,:) = reshape(hessd,size(hessdiag_emit,3),size(hessdiag_emit,2))';
         end
         pgd_lik = sum(tmp_pgd);
-
+        
+        if ~isempty(options.trainBins)
+            for trial = 1:length(stim)
+                newstim{trial}.data = stim{trial};
+            end
+        end
+        
         for i=1:numstates
+            [tmp_pgd(i),hessd] = emitLearningStats(reshape(squeeze(emit_w(i,:,:))',size(emit_w,2)*size(emit_w,3),1), newstim, i, options);
+            hessdiag_emit(i,:,:) = reshape(hessd,size(hessdiag_emit,3),size(hessdiag_emit,2))';
+            
             [tmp_pgd_lik(i),tmp_pgd(i),tmp_pgd2(i), tmp_pgd3_2, tmp_pgd4_2] = emitLikelihood(reshape(squeeze(emit_w(i,:,:))',size(emit_w,2)*size(emit_w,3),1), newstim, i);
             tmp_pgd3(i,:,:) = tmp_pgd3_2;
             tmp_pgd4(i,:,:) = tmp_pgd4_2;
@@ -296,8 +455,12 @@ if options.symbExists
         pgd_prob3 = squeeze(sum(tmp_pgd3,1));
         pgd_prob4 = squeeze(sum(tmp_pgd4,1));
     end
+    
+    
+
 else
     pgd_lik = 0;
+    pgd_prob = 0;
 end
 %% gradient descent for the transition filter
 
@@ -306,8 +469,13 @@ end
     for trial=1:length(stim)
         newstim{trial}.numstates = numstates;
         if options.GLMtransitions
-            newstim{trial}.data = stim{trial};
-            newstim{trial}.numtotalbins = numtotalbins;
+            if isempty(options.trainBins)
+                newstim{trial}.data = stim{trial};
+                newstim{trial}.numtotalbins = numtotalbins;
+            else
+                newstim{trial}.data = stim{trial}(options.trainBins,:);
+                newstim{trial}.numtotalbins = length(options.trainBins);
+            end
         else
             newstim{trial}.data = stim{trial}(end,:);
             newstim{trial}.numtotalbins = 1;
@@ -325,9 +493,22 @@ end
     else
         hessdiag_trans = zeros(numstates,numstates,numtotalbins);
         for i=1:numstates
-            outweights = minFunc(@(x) transLearningFun(x, newstim, i, options), reshape(squeeze(trans_w(i,:,:))',size(trans_w,2)*size(trans_w,3),1));
-            trans_w(i,:,:) = reshape(outweights,size(trans_w,3),size(trans_w,2))';
+            if isempty(options.trainBins)
+                outweights = minFunc(@(x) transLearningFun(x, newstim, i, options), reshape(squeeze(trans_w(i,:,:))',size(trans_w,2)*size(trans_w,3),1));
+                trans_w(i,:,:) = reshape(outweights,size(trans_w,3),size(trans_w,2))';
+            else
+                outweights = minFunc(@(x) transLearningFun(x, newstim, i, options), reshape(squeeze(trans_w(i,:,options.trainBins))',size(trans_w,2)*length(options.trainBins),1));
+                trans_w(i,:,options.trainBins) = reshape(outweights,length(options.trainBins),size(trans_w,2))';
+            end
+        end
+        
+        if ~isempty(options.trainBins)
+            for trial = 1:length(stim)
+                newstim{trial}.data = stim{trial};
+            end
+        end
 
+        for i=1:numstates
             tmp_tgd(i) = transLearningFun(reshape(squeeze(trans_w(i,:,:))',size(trans_w,2)*size(trans_w,3),1), newstim, i, options);
 
             if (numstates > 1)
@@ -354,6 +535,8 @@ end
                 for trial=1:length(stim)
                     newstim{trial}.symb = analog_symb{trial}(anum,:);
                     newstim{trial}.goodemit = ~isnan(analog_symb{trial}(anum,:));
+                    newstim{trial}.numtotalbins = numtotalbins;
+                    newstim{trial}.data = stim{trial};
                 end
                 [thesestim,thesesymb,thesegamma] = collectWLSInfo(newstim);
                 for states = 1:numstates
@@ -368,6 +551,8 @@ end
                 for trial=1:length(stim)
                     newstim{trial}.symb = analog_symb{trial}(anum,:);
                     newstim{trial}.goodemit = ~isnan(analog_symb{trial}(anum,:));
+                    newstim{trial}.data = stim{trial};
+                    newstim{trial}.numtotalbins = numtotalbins;
                 end
                 [thesestim,thesesymb,thesegamma] = collectWLSInfo(newstim);
 
@@ -399,7 +584,11 @@ end
                     usestim = randomizedstim(iterstim(nai,1):iterstim(nai,2));
                     for states = 1:numstates
                         if options.useASD
-                            [outweights,ASDstats] = fastASDweighted_group(thesestim(usestim,:),thesesymb(usestim),thesegamma(states,usestim),[ones(round(size(thesestim,2)/options.numFilterBins),1)*options.numFilterBins;1],2);
+                            if rem(size(thesestim,2),options.numFilterBins) == 1
+                                [outweights,ASDstats] = fastASDweighted_group(thesestim(usestim,:),thesesymb(usestim),thesegamma(states,usestim),[ones(round(size(thesestim,2)/options.numFilterBins),1)*options.numFilterBins;1],2);
+                            else
+                                [outweights,ASDstats] = fastASDweighted_group(thesestim(usestim,:),thesesymb(usestim),thesegamma(states,usestim),[ones(round(size(thesestim,2)/options.numFilterBins),1)*options.numFilterBins],2);
+                            end
                             aew(nai,states,:) = outweights;
                             aestd(nai,states,:) = ASDstats.Lpostdiag;
                         else
@@ -487,7 +676,7 @@ end
         end
     end
 
-    if options.symbExists
+    if options.symbExists && options.fitEmissions
         outvars(ind).emit_lik = emit_lik;
         outvars(ind).pgd_prob = pgd_prob;
         outvars(ind).pgd_prob2 = pgd_prob2;
@@ -507,7 +696,7 @@ end
     outvars(ind).tgd_lik = tgd_lik;
     outvars(ind).pgd_lik = pgd_lik;
     outvars(ind).loglik = loglik(2:ind+1);
-    outvars(ind).gamma = gamma;
+%     outvars(ind).gamma = gamma;
     outvars(ind).trans_lambda = options.trans_lambda;
     outvars(ind).emit_lambda = options.emit_lambda;
     outvars(ind).smoothLambda = options.smoothLambda;
